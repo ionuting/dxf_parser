@@ -688,13 +688,16 @@ async def generate_3d_geometry(request: Request):
             # Create a separate geometry for each contour
             for contour_idx, contour_points in enumerate(contours):
                 # Use Earcut for boolean difference if cut_layer is specified and Earcut is available
+                def sanitize_points(points):
+                    return [ (float(p[0]), float(p[1])) for p in points ]
+
                 if cut_contours and EARCUT_AVAILABLE:
                     try:
-                        # Create main polygon from contour
-                        main_polygon = Polygon(contour_points)
-                        
-                        # Create cut polygons
-                        cut_polygons = [Polygon(cut_contour) for cut_contour in cut_contours]
+                        # Create main polygon from contour (sanitize input)
+                        main_polygon = Polygon(sanitize_points(contour_points))
+
+                        # Create cut polygons (sanitize input)
+                        cut_polygons = [Polygon(sanitize_points(cut_contour)) for cut_contour in cut_contours]
                         cut_union = unary_union(cut_polygons)
                         
                         # Perform boolean difference
@@ -2537,7 +2540,6 @@ def get_html_interface():
                 const config = {
                     responsive: true,
                     displayModeBar: true,
-                    modeBarButtonsToRemove: ['toImage'],
                     displaylogo: false
                 };
                 
