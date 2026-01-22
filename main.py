@@ -17,12 +17,12 @@ import json
 try:
     from shapely.geometry import Polygon, Point
     from shapely.ops import unary_union
-    import triangle
+    import mapbox_earcut as earcut
     import numpy as np
-    SHAPELY_AVAILABLE = True
+    EARCUT_AVAILABLE = True
 except ImportError:
-    SHAPELY_AVAILABLE = False
-    print("⚠️ Shapely/Triangle not available - using simple extrusion only")
+    EARCUT_AVAILABLE = False
+    print("⚠️ Earcut not available - using simple extrusion only")
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -460,112 +460,81 @@ def create_simple_extrusion(contour_points, z_offset, height):
     
     return vertices, faces
 
-def triangulate_polygon_with_holes(exterior, holes, z_offset, height):
-    """Triangulate polygon with holes using triangle library"""
-    if not SHAPELY_AVAILABLE:
-        # Fallback to simple extrusion if shapely not available
+def extrude_polygon_with_holes(exterior, holes, z_offset, height):
+    """Extrude polygon with holes using earcut triangulation"""
+    if not EARCUT_AVAILABLE:
+        # Fallback to simple extrusion if earcut not available
         return create_simple_extrusion(exterior, z_offset, height)
     
-    vertices = []
-    faces = []
-    
-    # Prepare data for triangle library
-    segments = []
-    all_points = []
-    vertex_idx = 0
-    
-    # Add exterior points
-    exterior_start = vertex_idx
-    for i, point in enumerate(exterior):
-        all_points.append([float(point[0]), float(point[1])])
-        segments.append([int(vertex_idx), int((vertex_idx + 1) if i < len(exterior) - 1 else exterior_start)])
-        vertex_idx += 1
-    
-    # Add holes
-    hole_points = []
-    for hole in holes:
-        hole_start = vertex_idx
-        # Calculate hole center for hole marker
-        hole_center = [float(sum(p[0] for p in hole) / len(hole)), float(sum(p[1] for p in hole) / len(hole))]
-        hole_points.append(hole_center)
-        
-        for i, point in enumerate(hole):
-            all_points.append([float(point[0]), float(point[1])])
-            segments.append([int(vertex_idx), int((vertex_idx + 1) if i < len(hole) - 1 else hole_start)])
-            vertex_idx += 1
-    
-    # Create triangle input with explicit dtypes
-    tri_input = {
-        'vertices': np.array(all_points, dtype=np.float64),
-        'segments': np.array(segments, dtype=np.int32)
-    }
-    
-    if hole_points:
-        tri_input['holes'] = np.array(hole_points, dtype=np.float64)
-    
-    # Triangulate
     try:
-        tri_output = triangle.triangulate(tri_input, 'p')
-        triangles_2d = tri_output['triangles']
-        vertices_2d = tri_output['vertices']
-    except:
-        # Fallback to simple fan triangulation of exterior only
+        vertices = []
+        faces = []
+        
+        # Prepare data for earcut
+        # Earcut expects 2D array of coordinates (n, 2) and ring lengths
+        all_points = []
+        ring_ends = []
+        # Add exterior ring
+        for pt in exterior:
+            all_points.append([float(pt[0]), float(pt[1])])
+        ring_ends.append(len(exterior))
+        # Add hole rings
+        if holes:
+            for hole in holes:
+                for pt in hole:
+                    all_points.append([float(pt[0]), float(pt[1])])
+                ring_ends.append(ring_ends[-1] + len(hole))
+        # Convert to numpy arrays
+        vertices_2d = np.array(all_points, dtype=np.float64)
+        ring_ends_array = np.array(ring_ends, dtype=np.uint32)
+        # Triangulate using earcut
+        triangles = earcut.triangulate_float64(vertices_2d, ring_ends_array)
+        
+        n_points = len(all_points)
+        
+        # Create bottom vertices (at z_offset)
+        for pt in all_points:
+            vertices.append([pt[0], pt[1], z_offset])
+        
+        # Create top vertices (at z_offset + height)
+        for pt in all_points:
+            vertices.append([pt[0], pt[1], z_offset + height])
+        
+        # Bottom face triangles (from earcut)
+        for i in range(0, len(triangles), 3):
+            faces.append([int(triangles[i]), int(triangles[i+1]), int(triangles[i+2])])
+        
+        # Top face triangles (reversed winding)
+        for i in range(0, len(triangles), 3):
+            faces.append([int(triangles[i]) + n_points, int(triangles[i+2]) + n_points, int(triangles[i+1]) + n_points])
+        
+        # Side faces - exterior
+        n_ext = len(exterior)
+        for i in range(n_ext):
+            next_i = (i + 1) % n_ext
+            # Two triangles per quad
+            faces.append([i, next_i, i + n_points])
+            faces.append([next_i, next_i + n_points, i + n_points])
+        
+        # Side faces - holes (reversed winding for inward facing)
+        point_offset = n_ext
+        if holes:
+            for hole in holes:
+                n_hole = len(hole)
+                for i in range(n_hole):
+                    curr = point_offset + i
+                    next_i = point_offset + ((i + 1) % n_hole)
+                    # Reversed winding for holes
+                    faces.append([curr, curr + n_points, next_i])
+                    faces.append([next_i, curr + n_points, next_i + n_points])
+                point_offset += n_hole
+        
+        return vertices, faces
+        
+    except Exception as e:
+        import traceback
+        logger.warning(f"Earcut triangulation failed: {e}\n{traceback.format_exc()}")
         return create_simple_extrusion(exterior, z_offset, height)
-    
-    num_verts = len(vertices_2d)
-    
-    # Create 3D vertices - bottom face
-    for i, (x, y) in enumerate(vertices_2d):
-        vertices.append([x, y, z_offset])
-    
-    # Create 3D vertices - top face
-    for i, (x, y) in enumerate(vertices_2d):
-        vertices.append([x, y, z_offset + height])
-    
-    # Bottom face triangles
-    for tri in triangles_2d:
-        faces.append([int(tri[0]), int(tri[1]), int(tri[2])])
-    
-    # Top face triangles (reversed winding)
-    for tri in triangles_2d:
-        faces.append([int(tri[0]) + num_verts, int(tri[2]) + num_verts, int(tri[1]) + num_verts])
-    
-    # Side faces - use original boundary points from all_points
-    # Create mapping from original point indices to triangulated vertex indices
-    original_to_tri = {}
-    for orig_idx, orig_point in enumerate(all_points):
-        # Find this point in vertices_2d
-        for tri_idx, tri_point in enumerate(vertices_2d):
-            if abs(tri_point[0] - orig_point[0]) < 1e-6 and abs(tri_point[1] - orig_point[1]) < 1e-6:
-                original_to_tri[orig_idx] = tri_idx
-                break
-    
-    # Side faces - exterior
-    n_ext = len(exterior)
-    for i in range(n_ext):
-        next_i = (i + 1) % n_ext
-        if i in original_to_tri and next_i in original_to_tri:
-            v1 = original_to_tri[i]
-            v2 = original_to_tri[next_i]
-            faces.append([v1, v2, v1 + num_verts])
-            faces.append([v2, v2 + num_verts, v1 + num_verts])
-    
-    # Side faces - holes
-    hole_start_idx = n_ext
-    for hole in holes:
-        n_hole = len(hole)
-        for i in range(n_hole):
-            curr_orig = hole_start_idx + i
-            next_orig = hole_start_idx + ((i + 1) % n_hole)
-            if curr_orig in original_to_tri and next_orig in original_to_tri:
-                curr = original_to_tri[curr_orig]
-                next_v = original_to_tri[next_orig]
-                # Reverse winding for holes (inward facing)
-                faces.append([curr, curr + num_verts, next_v])
-                faces.append([next_v, curr + num_verts, next_v + num_verts])
-        hole_start_idx += n_hole
-    
-    return vertices, faces
 
 @app.post("/api/generate-3d-geometry")
 async def generate_3d_geometry(request: Request):
@@ -649,8 +618,10 @@ async def generate_3d_geometry(request: Request):
                     for p in contour_points[1:]:
                         if p != unique_points[-1]:
                             unique_points.append(p)
-                    
-                    if len(unique_points) >= 3:
+                    # Ensure closed polygon (first == last)
+                    if unique_points[0] != unique_points[-1]:
+                        unique_points.append(unique_points[0])
+                    if len(unique_points) >= 4:
                         contours.append(unique_points)
             
             # Extract cut contours if cut_layer is specified
@@ -716,8 +687,8 @@ async def generate_3d_geometry(request: Request):
             
             # Create a separate geometry for each contour
             for contour_idx, contour_points in enumerate(contours):
-                # Use Shapely for boolean difference if cut_layer is specified and Shapely is available
-                if cut_contours and SHAPELY_AVAILABLE:
+                # Use Earcut for boolean difference if cut_layer is specified and Earcut is available
+                if cut_contours and EARCUT_AVAILABLE:
                     try:
                         # Create main polygon from contour
                         main_polygon = Polygon(contour_points)
@@ -737,12 +708,33 @@ async def generate_3d_geometry(request: Request):
                         if result_polygon.geom_type == 'Polygon':
                             exterior_coords = list(result_polygon.exterior.coords[:-1])  # Remove duplicate last point
                             holes = [list(hole.coords[:-1]) for hole in result_polygon.interiors]
+                            
+                            # Extrude polygon with holes
+                            vertices, faces = extrude_polygon_with_holes(exterior_coords, holes, z_offset, height)
+                            volume = result_polygon.area * height
+                            
+                            geometries.append({
+                                "operation_name": operation_name,
+                                "operation_color": operation_color,
+                                "contour_layer": contour_layer,
+                                "contour_index": contour_idx,
+                                "cut_layer": cut_layer,
+                                "z_offset": z_offset,
+                                "height": height,
+                                "volume": volume,
+                                "vertices": vertices,
+                                "faces": faces,
+                                "vertex_count": len(vertices),
+                                "face_count": len(faces)
+                            })
+                            continue
+                            
                         elif result_polygon.geom_type == 'MultiPolygon':
                             # Handle multiple polygons - process each separately
                             for poly in result_polygon.geoms:
                                 exterior_coords = list(poly.exterior.coords[:-1])
                                 holes = [list(hole.coords[:-1]) for hole in poly.interiors]
-                                vertices, faces = triangulate_polygon_with_holes(exterior_coords, holes, z_offset, height)
+                                vertices, faces = extrude_polygon_with_holes(exterior_coords, holes, z_offset, height)
                                 
                                 volume = poly.area * height
                                 
@@ -764,10 +756,6 @@ async def generate_3d_geometry(request: Request):
                         else:
                             continue
                         
-                        # Triangulate polygon with holes
-                        vertices, faces = triangulate_polygon_with_holes(exterior_coords, holes, z_offset, height)
-                        volume = result_polygon.area * height
-                        
                     except Exception as e:
                         logger.warning(f"Shapely boolean operation failed: {e}, using simple extrusion")
                         # Fallback to simple extrusion
@@ -785,8 +773,8 @@ async def generate_3d_geometry(request: Request):
                             effective_area = 0
                         volume = effective_area * height
                         
-                elif cut_contours and not SHAPELY_AVAILABLE:
-                    # Shapely not available - use simple volume subtraction
+                elif cut_contours and not EARCUT_AVAILABLE:
+                    # Earcut not available - use simple volume subtraction
                     vertices, faces = create_simple_extrusion(contour_points, z_offset, height)
                     
                     # Calculate volume using Shoelace formula (subtract cut area)
@@ -802,9 +790,10 @@ async def generate_3d_geometry(request: Request):
                     volume = effective_area * height
                     
                 else:
-                    # No cut layer - simple extrusion
-                    vertices, faces = create_simple_extrusion(contour_points, z_offset, height)
-                    
+                    # No cut layer - use earcut triangulation for all polygons
+                    exterior = contour_points
+                    holes = []
+                    vertices, faces = extrude_polygon_with_holes(exterior, holes, z_offset, height)
                     # Calculate volume using Shoelace formula
                     area = 0
                     n = len(contour_points)
@@ -2137,7 +2126,11 @@ def get_html_interface():
                         })
                     });
                     
-                    if (!response.ok) throw new Error('Failed to generate geometry');
+                    if (!response.ok) {
+                        const errorData = await response.json().catch(() => ({}));
+                        const errorMessage = errorData.detail || 'Failed to generate geometry';
+                        throw new Error(errorMessage);
+                    }
                     
                     const data = await response.json();
                     
