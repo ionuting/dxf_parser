@@ -1,5 +1,6 @@
-
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+import csv
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 import ezdxf
@@ -539,6 +540,7 @@ def extrude_polygon_with_holes(exterior, holes, z_offset, height):
 @app.post("/api/generate-3d-geometry")
 async def generate_3d_geometry(request: Request):
     """Generate 3D extruded geometry from layer contours"""
+    import math
     try:
         payload = await request.json()
         file_id = payload.get("file_id")
@@ -689,16 +691,65 @@ async def generate_3d_geometry(request: Request):
             for contour_idx, contour_points in enumerate(contours):
                 # Use Earcut for boolean difference if cut_layer is specified and Earcut is available
                 def sanitize_points(points):
-                    return [ (float(p[0]), float(p[1])) for p in points ]
+                    """Convert all points to float tuples and ensure validity"""
+                    sanitized = []
+                    for p in points:
+                        try:
+                            x, y = float(p[0]), float(p[1])
+                            if not (math.isnan(x) or math.isnan(y) or math.isinf(x) or math.isinf(y)):
+                                sanitized.append((x, y))
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                    return sanitized
 
                 if cut_contours and EARCUT_AVAILABLE:
                     try:
-                        # Create main polygon from contour (sanitize input)
-                        main_polygon = Polygon(sanitize_points(contour_points))
-
-                        # Create cut polygons (sanitize input)
-                        cut_polygons = [Polygon(sanitize_points(cut_contour)) for cut_contour in cut_contours]
-                        cut_union = unary_union(cut_polygons)
+                        # Sanitize contour points
+                        clean_contour = sanitize_points(contour_points)
+                        if len(clean_contour) < 3:
+                            logger.warning(f"Contour invalid after sanitization (< 3 points), skipping")
+                            continue
+                        
+                        # Create main polygon from contour
+                        main_polygon = Polygon(clean_contour)
+                        
+                        # Validate main polygon
+                        if not main_polygon.is_valid:
+                            main_polygon = main_polygon.buffer(0)
+                            if not main_polygon.is_valid or main_polygon.is_empty:
+                                logger.warning("Main polygon invalid after buffer, skipping")
+                                continue
+                        
+                        # Create cut polygons (sanitize each one)
+                        cut_polygons = []
+                        for cut_contour in cut_contours:
+                            clean_cut = sanitize_points(cut_contour)
+                            if len(clean_cut) >= 3:
+                                cut_poly = Polygon(clean_cut)
+                                if cut_poly.is_valid:
+                                    cut_polygons.append(cut_poly)
+                                else:
+                                    # Try to fix invalid polygon
+                                    cut_poly = cut_poly.buffer(0)
+                                    if cut_poly.is_valid and not cut_poly.is_empty:
+                                        cut_polygons.append(cut_poly)
+                        
+                        if not cut_polygons:
+                            logger.warning("No valid cut polygons, using simple extrusion")
+                            raise ValueError("No valid cut polygons")
+                        
+                        # Union cut polygons (more robust)
+                        cut_union = None
+                        if len(cut_polygons) == 1:
+                            cut_union = cut_polygons[0]
+                        else:
+                            try:
+                                cut_union = cut_polygons[0]
+                                for cp in cut_polygons[1:]:
+                                    cut_union = cut_union.union(cp)
+                            except Exception as e:
+                                logger.warning(f"Union of cut polygons failed: {e}, using first polygon")
+                                cut_union = cut_polygons[0]
                         
                         # Perform boolean difference
                         result_polygon = main_polygon.difference(cut_union)
@@ -994,6 +1045,153 @@ async def generate_report(request: Request):
         logger.error(f"Report generation error: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=400, detail=f"Report error: {str(e)}")
+
+@app.post("/api/download-csv-report")
+async def download_csv_report(request: Request):
+    """Generează și descarcă raportul complet (statistici + extruziuni) ca CSV"""
+    import math
+    try:
+        payload = await request.json()
+        file_id = payload.get("file_id")
+        selected_layers = payload.get("selected_layers", [])
+        extrusions = payload.get("extrusions", [])
+        unit = payload.get("unit", "mm")
+
+        if file_id not in loaded_files:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        # --- 1. Statistici per layer (lungimi, arii, etc) ---
+        unit_factors = {
+            "mm": {"length": 1, "area": 1},
+            "cm": {"length": 0.1, "area": 0.01},
+            "m": {"length": 0.001, "area": 0.000001}
+        }
+        factor = unit_factors.get(unit, unit_factors["mm"])
+        temp_file = TEMP_DIR / f"temp_csv_{uuid.uuid4()}.dxf"
+        with open(temp_file, 'wb') as f:
+            f.write(loaded_files[file_id])
+        doc = ezdxf.readfile(str(temp_file))
+        temp_file.unlink()
+        
+        # Calcul statistici per layer
+        layer_reports = {}
+        for layer_name in selected_layers:
+            layer_reports[layer_name] = {
+                "total_length": 0,
+                "total_area": 0,
+                "max_length": 0,
+                "max_area": 0,
+                "entity_count": 0
+            }
+        
+        msp = doc.modelspace()
+        for entity in msp:
+            try:
+                layer_name = str(entity.dxf.layer)
+                if layer_name not in selected_layers:
+                    continue
+                entity_type = entity.dxftype()
+                length = 0
+                area = 0
+                if entity_type == "LINE":
+                    start = entity.dxf.start
+                    end = entity.dxf.end
+                    length = math.sqrt((end[0]-start[0])**2 + (end[1]-start[1])**2 + (end[2]-start[2])**2)
+                elif entity_type in ["LWPOLYLINE", "POLYLINE"]:
+                    points = list(entity.get_points())
+                    if len(points) > 1:
+                        for i in range(len(points) - 1):
+                            p1 = points[i]
+                            p2 = points[i + 1]
+                            length += math.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
+                        if entity.is_closed:
+                            p1 = points[-1]
+                            p2 = points[0]
+                            length += math.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
+                            area = 0
+                            for i in range(len(points)):
+                                j = (i + 1) % len(points)
+                                area += points[i][0] * points[j][1]
+                                area -= points[j][0] * points[i][1]
+                            area = abs(area) / 2.0
+                elif entity_type == "CIRCLE":
+                    radius = entity.dxf.radius
+                    length = 2 * math.pi * radius
+                    area = math.pi * radius ** 2
+                elif entity_type == "ARC":
+                    radius = entity.dxf.radius
+                    start_angle = math.radians(entity.dxf.start_angle)
+                    end_angle = math.radians(entity.dxf.end_angle)
+                    angle_diff = end_angle - start_angle
+                    if angle_diff < 0:
+                        angle_diff += 2 * math.pi
+                    length = radius * angle_diff
+                elif entity_type == "ELLIPSE":
+                    major_axis = entity.dxf.major_axis
+                    ratio = entity.dxf.ratio
+                    a = math.sqrt(major_axis[0]**2 + major_axis[1]**2 + major_axis[2]**2)
+                    b = a * ratio
+                    h = ((a - b) ** 2) / ((a + b) ** 2)
+                    length = math.pi * (a + b) * (1 + (3 * h) / (10 + math.sqrt(4 - 3 * h)))
+                    area = math.pi * a * b
+                if length > 0 or area > 0:
+                    layer_reports[layer_name]["total_length"] += length
+                    layer_reports[layer_name]["total_area"] += area
+                    layer_reports[layer_name]["max_length"] = max(layer_reports[layer_name]["max_length"], length)
+                    layer_reports[layer_name]["max_area"] = max(layer_reports[layer_name]["max_area"], area)
+                    layer_reports[layer_name]["entity_count"] += 1
+            except Exception as e:
+                continue
+
+        # --- 2. Date extruziuni (geometries) ---
+        geometries = extrusions if extrusions else []
+
+        # --- 3. Scriere CSV ---
+        def csv_rows():
+            # Secțiunea 1: Statistici per layer
+            if layer_reports:
+                yield ["Layer Statistics", "", "", "", "", ""]
+                yield ["Layer", "Entity count", f"Total length ({unit})", f"Total area ({unit}²)", f"Max length ({unit})", f"Max area ({unit}²)"]
+                for layer, stats in layer_reports.items():
+                    yield [layer, stats["entity_count"],
+                           round(stats["total_length"] * factor["length"], 3),
+                           round(stats["total_area"] * factor["area"], 3),
+                           round(stats["max_length"] * factor["length"], 3),
+                           round(stats["max_area"] * factor["area"], 3)]
+                yield []
+            
+            # Secțiunea 2: Extruziuni solide
+            if geometries:
+                yield ["Extrusions", "", "", "", "", "", "", ""]
+                yield ["Operation name", "Contour layer", "Cut layer", "Z offset (mm)", "Height (mm)", "Volume (mm³)", "Vertex count", "Face count"]
+                for geom in geometries:
+                    yield [geom.get("operation_name", ""),
+                           geom.get("contour_layer", ""),
+                           geom.get("cut_layer", "") or "None",
+                           geom.get("z_offset", ""),
+                           geom.get("height", ""),
+                           round(geom.get("volume", 0), 3),
+                           geom.get("vertex_count", ""),
+                           geom.get("face_count", "")]
+
+        def iter_csv():
+            output = io.StringIO()
+            writer = csv.writer(output)
+            for row in csv_rows():
+                writer.writerow(row)
+                yield output.getvalue()
+                output.seek(0)
+                output.truncate(0)
+
+        return StreamingResponse(iter_csv(), media_type="text/csv", headers={
+            "Content-Disposition": "attachment; filename=report.csv"
+        })
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"CSV report error: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=400, detail=f"CSV error: {str(e)}")
 
 def get_html_interface():
     return """
@@ -1539,6 +1737,9 @@ def get_html_interface():
                     <button class="btn-secondary" id="reportBtn" onclick="generateReport()" disabled>
                         Generate Report
                     </button>
+                    <button class="btn-secondary" id="downloadCSVBtn" onclick="downloadReportCSV()" disabled title="Download full report as CSV">
+                        📥 Download CSV
+                    </button>
                     <button class="btn-secondary" id="clearBtn" onclick="clearAll()" disabled>
                         Clear and Reload
                     </button>
@@ -1928,6 +2129,11 @@ def get_html_interface():
                     
                     displayReport(data.report, data.unit);
                     showCalculator();
+                    
+                    // Enable CSV download button
+                    const csvBtn = document.getElementById('downloadCSVBtn');
+                    if (csvBtn) csvBtn.disabled = false;
+                    
                     showStatus('Report generated successfully!', 'success');
                     
                 } catch (error) {
@@ -1988,6 +2194,108 @@ def get_html_interface():
                 
                 // Scroll to report
                 section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+            
+            async function downloadReportCSV() {
+                console.log('📥 Downloading CSV report...');
+                
+                if (!currentFileId) {
+                    showStatus('Please upload a file first!', 'error');
+                    return;
+                }
+                
+                if (selectedLayers.size === 0) {
+                    showStatus('Please select at least one layer first!', 'error');
+                    return;
+                }
+                
+                showLoading(true);
+                
+                try {
+                    const extrusions = [];
+                    const geometryRows = document.getElementById('geometryRows');
+                    
+                    // Collect extrusion data if any rows exist
+                    if (geometryRows && geometryRows.children.length > 0) {
+                        for (let i = 0; i < geometryRows.children.length; i++) {
+                            const row = geometryRows.children[i];
+                            const rowId = row.id.split('-')[2];
+                            
+                            const operationName = document.getElementById(`geom-name-${rowId}`).value || `Extrusion ${i + 1}`;
+                            const operationColor = document.getElementById(`geom-color-${rowId}`).value || '#4CAF50';
+                            const contourLayer = document.getElementById(`geom-contour-${rowId}`).value;
+                            const cutLayer = document.getElementById(`geom-cut-${rowId}`).value;
+                            const zOffset = parseFloat(document.getElementById(`geom-offset-${rowId}`).value) || 0;
+                            const height = parseFloat(document.getElementById(`geom-height-${rowId}`).value) || 100;
+                            
+                            if (contourLayer) {
+                                extrusions.push({
+                                    operation_name: operationName,
+                                    operation_color: operationColor,
+                                    contour_layer: contourLayer,
+                                    cut_layer: cutLayer || null,
+                                    z_offset: zOffset,
+                                    height: height,
+                                    volume: 0, // Will be filled from geometries if available
+                                    vertex_count: 0,
+                                    face_count: 0
+                                });
+                            }
+                        }
+                    }
+                    
+                    // If geometries were rendered, use those data
+                    if (window.lastGeometries && window.lastGeometries.length > 0) {
+                        // Map the generated geometries to the extrusions payload
+                        const geomData = window.lastGeometries.map(geom => ({
+                            operation_name: geom.operation_name,
+                            operation_color: geom.operation_color,
+                            contour_layer: geom.contour_layer,
+                            cut_layer: geom.cut_layer,
+                            z_offset: geom.z_offset,
+                            height: geom.height,
+                            volume: geom.volume,
+                            vertex_count: geom.vertex_count,
+                            face_count: geom.face_count
+                        }));
+                        extrusions.splice(0, extrusions.length, ...geomData);
+                    }
+                    
+                    const response = await fetch('/api/download-csv-report', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            file_id: currentFileId,
+                            selected_layers: Array.from(selectedLayers),
+                            extrusions: extrusions,
+                            unit: document.getElementById('calcUnit').value || 'mm'
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    
+                    // Download file
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `report_${new Date().toISOString().split('T')[0]}.csv`;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    window.URL.revokeObjectURL(url);
+                    
+                    showStatus('Report downloaded successfully!', 'success');
+                    console.log('✅ CSV report downloaded');
+                    
+                } catch (error) {
+                    console.error('❌ Download error:', error);
+                    showStatus(`Error: ${error.message}`, 'error');
+                } finally {
+                    showLoading(false);
+                }
             }
             
             function showCalculator() {
@@ -2152,6 +2460,13 @@ def get_html_interface():
             
             function render3DGeometry(geometries) {
                 console.log('🎲 Rendering 3D geometry:', geometries.length, 'solids');
+                
+                // Save geometries for CSV download
+                window.lastGeometries = geometries;
+                
+                // Enable CSV download button
+                const csvBtn = document.getElementById('downloadCSVBtn');
+                if (csvBtn) csvBtn.disabled = false;
                 
                 const traces = [];
                 const volumesByOperation = {};  // Group volumes by operation name
