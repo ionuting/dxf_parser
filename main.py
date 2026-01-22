@@ -12,6 +12,10 @@ import uuid
 from typing import List
 import logging
 import json
+from shapely.geometry import Polygon, Point
+from shapely.ops import unary_union
+import triangle
+import numpy as np
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -413,6 +417,382 @@ async def get_entities(request: Request):
     except Exception as e:
         import traceback
         logger.error(f"Get entities error: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=400, detail=f"Error: {str(e)}")
+
+def create_simple_extrusion(contour_points, z_offset, height):
+    """Create simple extrusion without holes"""
+    vertices = []
+    faces = []
+    
+    # Bottom face vertices (at z_offset)
+    for p in contour_points:
+        vertices.append([p[0], p[1], z_offset])
+    
+    # Top face vertices (at z_offset + height)
+    for p in contour_points:
+        vertices.append([p[0], p[1], z_offset + height])
+    
+    n = len(contour_points)
+    
+    # Bottom face triangles (fan triangulation from first vertex)
+    for i in range(1, n - 1):
+        faces.append([0, i, i + 1])
+    
+    # Top face triangles (fan triangulation from first vertex, reversed winding)
+    for i in range(1, n - 1):
+        faces.append([n, n + i + 1, n + i])
+    
+    # Side face quads (split into 2 triangles each)
+    for i in range(n):
+        next_i = (i + 1) % n
+        # First triangle of quad
+        faces.append([i, next_i, n + i])
+        # Second triangle of quad
+        faces.append([next_i, n + next_i, n + i])
+    
+    return vertices, faces
+
+def triangulate_polygon_with_holes(exterior, holes, z_offset, height):
+    """Triangulate polygon with holes using triangle library"""
+    vertices = []
+    faces = []
+    
+    # Prepare data for triangle library
+    segments = []
+    all_points = []
+    vertex_idx = 0
+    
+    # Add exterior points
+    exterior_start = vertex_idx
+    for i, point in enumerate(exterior):
+        all_points.append([point[0], point[1]])
+        segments.append([vertex_idx, (vertex_idx + 1) if i < len(exterior) - 1 else exterior_start])
+        vertex_idx += 1
+    
+    # Add holes
+    hole_points = []
+    for hole in holes:
+        hole_start = vertex_idx
+        # Calculate hole center for hole marker
+        hole_center = [sum(p[0] for p in hole) / len(hole), sum(p[1] for p in hole) / len(hole)]
+        hole_points.append(hole_center)
+        
+        for i, point in enumerate(hole):
+            all_points.append([point[0], point[1]])
+            segments.append([vertex_idx, (vertex_idx + 1) if i < len(hole) - 1 else hole_start])
+            vertex_idx += 1
+    
+    # Create triangle input
+    tri_input = {
+        'vertices': np.array(all_points),
+        'segments': np.array(segments)
+    }
+    
+    if hole_points:
+        tri_input['holes'] = np.array(hole_points)
+    
+    # Triangulate
+    try:
+        tri_output = triangle.triangulate(tri_input, 'p')
+        triangles_2d = tri_output['triangles']
+        vertices_2d = tri_output['vertices']
+    except:
+        # Fallback to simple fan triangulation of exterior only
+        return create_simple_extrusion(exterior, z_offset, height)
+    
+    num_verts = len(vertices_2d)
+    
+    # Create 3D vertices - bottom face
+    for i, (x, y) in enumerate(vertices_2d):
+        vertices.append([x, y, z_offset])
+    
+    # Create 3D vertices - top face
+    for i, (x, y) in enumerate(vertices_2d):
+        vertices.append([x, y, z_offset + height])
+    
+    # Bottom face triangles
+    for tri in triangles_2d:
+        faces.append([int(tri[0]), int(tri[1]), int(tri[2])])
+    
+    # Top face triangles (reversed winding)
+    for tri in triangles_2d:
+        faces.append([int(tri[0]) + num_verts, int(tri[2]) + num_verts, int(tri[1]) + num_verts])
+    
+    # Side faces - use original boundary points from all_points
+    # Create mapping from original point indices to triangulated vertex indices
+    original_to_tri = {}
+    for orig_idx, orig_point in enumerate(all_points):
+        # Find this point in vertices_2d
+        for tri_idx, tri_point in enumerate(vertices_2d):
+            if abs(tri_point[0] - orig_point[0]) < 1e-6 and abs(tri_point[1] - orig_point[1]) < 1e-6:
+                original_to_tri[orig_idx] = tri_idx
+                break
+    
+    # Side faces - exterior
+    n_ext = len(exterior)
+    for i in range(n_ext):
+        next_i = (i + 1) % n_ext
+        if i in original_to_tri and next_i in original_to_tri:
+            v1 = original_to_tri[i]
+            v2 = original_to_tri[next_i]
+            faces.append([v1, v2, v1 + num_verts])
+            faces.append([v2, v2 + num_verts, v1 + num_verts])
+    
+    # Side faces - holes
+    hole_start_idx = n_ext
+    for hole in holes:
+        n_hole = len(hole)
+        for i in range(n_hole):
+            curr_orig = hole_start_idx + i
+            next_orig = hole_start_idx + ((i + 1) % n_hole)
+            if curr_orig in original_to_tri and next_orig in original_to_tri:
+                curr = original_to_tri[curr_orig]
+                next_v = original_to_tri[next_orig]
+                # Reverse winding for holes (inward facing)
+                faces.append([curr, curr + num_verts, next_v])
+                faces.append([next_v, curr + num_verts, next_v + num_verts])
+        hole_start_idx += n_hole
+    
+    return vertices, faces
+
+@app.post("/api/generate-3d-geometry")
+async def generate_3d_geometry(request: Request):
+    """Generate 3D extruded geometry from layer contours"""
+    try:
+        payload = await request.json()
+        file_id = payload.get("file_id")
+        extrusions = payload.get("extrusions", [])
+        
+        if file_id not in loaded_files:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Read the DXF file
+        temp_file = TEMP_DIR / f"temp_3d_{uuid.uuid4()}.dxf"
+        with open(temp_file, 'wb') as f:
+            f.write(loaded_files[file_id])
+        
+        doc = ezdxf.readfile(str(temp_file))
+        temp_file.unlink()
+        
+        geometries = []
+        
+        for extrusion in extrusions:
+            operation_name = extrusion.get("operation_name", "Extrusion")
+            operation_color = extrusion.get("operation_color", "#4CAF50")
+            contour_layer = extrusion.get("contour_layer")
+            cut_layer = extrusion.get("cut_layer")
+            z_offset = float(extrusion.get("z_offset", 0))
+            height = float(extrusion.get("height", 100))
+            
+            # Extract each closed contour as separate entity
+            msp = doc.modelspace()
+            contours = []  # List of contours, each contour is a list of points
+            
+            for entity in msp.query(f'*[layer=="{contour_layer}"]'):
+                contour_points = []
+                
+                if entity.dxftype() == 'LWPOLYLINE':
+                    points = [(p[0], p[1]) for p in entity.get_points()]
+                    # Process even if not explicitly closed - check if first and last point are same
+                    if len(points) > 2:
+                        if not entity.closed and points[0] != points[-1]:
+                            # If not closed but forms a loop, close it
+                            import math
+                            dist = math.sqrt((points[0][0] - points[-1][0])**2 + (points[0][1] - points[-1][1])**2)
+                            if dist < 0.001:  # Very close, treat as closed
+                                points[-1] = points[0]
+                            else:
+                                # Not a closed contour, skip
+                                continue
+                        contour_points = points
+                        
+                elif entity.dxftype() == 'POLYLINE':
+                    points = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+                    if len(points) > 2:
+                        if not entity.is_closed and points[0] != points[-1]:
+                            import math
+                            dist = math.sqrt((points[0][0] - points[-1][0])**2 + (points[0][1] - points[-1][1])**2)
+                            if dist < 0.001:
+                                points[-1] = points[0]
+                            else:
+                                continue
+                        contour_points = points
+                        
+                elif entity.dxftype() == 'CIRCLE':
+                    # Approximate circle with polygon
+                    center = entity.dxf.center
+                    radius = entity.dxf.radius
+                    segments = 32
+                    import math
+                    for i in range(segments):
+                        angle = (i / segments) * 2 * math.pi
+                        x = center.x + radius * math.cos(angle)
+                        y = center.y + radius * math.sin(angle)
+                        contour_points.append((x, y))
+                
+                # Add this contour if valid
+                if len(contour_points) >= 3:
+                    # Remove consecutive duplicates
+                    unique_points = [contour_points[0]]
+                    for p in contour_points[1:]:
+                        if p != unique_points[-1]:
+                            unique_points.append(p)
+                    
+                    if len(unique_points) >= 3:
+                        contours.append(unique_points)
+            
+            # Extract cut contours if cut_layer is specified
+            cut_contours = []
+            if cut_layer:
+                for entity in msp.query(f'*[layer=="{cut_layer}"]'):
+                    contour_points = []
+                    
+                    if entity.dxftype() == 'LWPOLYLINE':
+                        points = [(p[0], p[1]) for p in entity.get_points()]
+                        if len(points) > 2:
+                            if not entity.closed and points[0] != points[-1]:
+                                import math
+                                dist = math.sqrt((points[0][0] - points[-1][0])**2 + (points[0][1] - points[-1][1])**2)
+                                if dist < 0.001:
+                                    points[-1] = points[0]
+                                else:
+                                    continue
+                            contour_points = points
+                            
+                    elif entity.dxftype() == 'POLYLINE':
+                        points = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+                        if len(points) > 2:
+                            if not entity.is_closed and points[0] != points[-1]:
+                                import math
+                                dist = math.sqrt((points[0][0] - points[-1][0])**2 + (points[0][1] - points[-1][1])**2)
+                                if dist < 0.001:
+                                    points[-1] = points[0]
+                                else:
+                                    continue
+                            contour_points = points
+                            
+                    elif entity.dxftype() == 'CIRCLE':
+                        center = entity.dxf.center
+                        radius = entity.dxf.radius
+                        segments = 32
+                        import math
+                        for i in range(segments):
+                            angle = (i / segments) * 2 * math.pi
+                            x = center.x + radius * math.cos(angle)
+                            y = center.y + radius * math.sin(angle)
+                            contour_points.append((x, y))
+                    
+                    if len(contour_points) >= 3:
+                        unique_points = [contour_points[0]]
+                        for p in contour_points[1:]:
+                            if p != unique_points[-1]:
+                                unique_points.append(p)
+                        
+                        if len(unique_points) >= 3:
+                            cut_contours.append(unique_points)
+            
+            # Calculate total area of cut contours
+            cut_area = 0
+            for cut_contour in cut_contours:
+                area = 0
+                n = len(cut_contour)
+                for i in range(n):
+                    j = (i + 1) % n
+                    area += cut_contour[i][0] * cut_contour[j][1]
+                    area -= cut_contour[j][0] * cut_contour[i][1]
+                cut_area += abs(area) / 2.0
+            
+            # Create a separate geometry for each contour
+            for contour_idx, contour_points in enumerate(contours):
+                # Use Shapely for boolean difference if cut_layer is specified
+                if cut_contours:
+                    # Create main polygon from contour
+                    main_polygon = Polygon(contour_points)
+                    
+                    # Create cut polygons
+                    cut_polygons = [Polygon(cut_contour) for cut_contour in cut_contours]
+                    cut_union = unary_union(cut_polygons)
+                    
+                    # Perform boolean difference
+                    result_polygon = main_polygon.difference(cut_union)
+                    
+                    # Check if result is valid
+                    if result_polygon.is_empty:
+                        continue
+                    
+                    # Get exterior and holes
+                    if result_polygon.geom_type == 'Polygon':
+                        exterior_coords = list(result_polygon.exterior.coords[:-1])  # Remove duplicate last point
+                        holes = [list(hole.coords[:-1]) for hole in result_polygon.interiors]
+                    elif result_polygon.geom_type == 'MultiPolygon':
+                        # Handle multiple polygons - process each separately
+                        for poly in result_polygon.geoms:
+                            exterior_coords = list(poly.exterior.coords[:-1])
+                            holes = [list(hole.coords[:-1]) for hole in poly.interiors]
+                            vertices, faces = triangulate_polygon_with_holes(exterior_coords, holes, z_offset, height)
+                            
+                            volume = poly.area * height
+                            
+                            geometries.append({
+                                "operation_name": operation_name,
+                                "operation_color": operation_color,
+                                "contour_layer": contour_layer,
+                                "contour_index": contour_idx,
+                                "cut_layer": cut_layer,
+                                "z_offset": z_offset,
+                                "height": height,
+                                "volume": volume,
+                                "vertices": vertices,
+                                "faces": faces,
+                                "vertex_count": len(vertices),
+                                "face_count": len(faces)
+                            })
+                        continue
+                    else:
+                        continue
+                    
+                    # Triangulate polygon with holes
+                    vertices, faces = triangulate_polygon_with_holes(exterior_coords, holes, z_offset, height)
+                    volume = result_polygon.area * height
+                    
+                else:
+                    # No cut layer - simple extrusion
+                    vertices, faces = create_simple_extrusion(contour_points, z_offset, height)
+                    
+                    # Calculate volume using Shoelace formula
+                    area = 0
+                    n = len(contour_points)
+                    for i in range(n):
+                        j = (i + 1) % n
+                        area += contour_points[i][0] * contour_points[j][1]
+                        area -= contour_points[j][0] * contour_points[i][1]
+                    volume = abs(area) / 2.0 * height
+                
+                geometries.append({
+                    "operation_name": operation_name,
+                    "operation_color": operation_color,
+                    "contour_layer": contour_layer,
+                    "contour_index": contour_idx,
+                    "cut_layer": cut_layer,
+                    "z_offset": z_offset,
+                    "height": height,
+                    "volume": volume,
+                    "vertices": vertices,
+                    "faces": faces,
+                    "vertex_count": len(vertices),
+                    "face_count": len(faces)
+                })
+        
+        return {
+            "status": "success",
+            "geometries": geometries,
+            "count": len(geometries)
+        }
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"Generate 3D geometry error: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=400, detail=f"Error: {str(e)}")
 
@@ -1096,6 +1476,12 @@ def get_html_interface():
                     </div>
                 </div>
                 
+                <!-- Volume Analysis Section -->
+                <div class="section" id="volumeAnalysisSection" style="display: none;">
+                    <div class="section-title">📊 Volume Analysis by Operation</div>
+                    <div id="volumeChartContainer" style="height: 400px;"></div>
+                </div>
+                
                 <!-- Unit Selection -->
                 <div class="section">
                     <div class="section-title">3. Measurement Unit</div>
@@ -1127,6 +1513,21 @@ def get_html_interface():
                     <div id="reportContainer"></div>
                 </div>
                 
+                <!-- 3D Geometry Generator Section -->
+                <div class="section" id="geometryGeneratorSection" style="display: none;">
+                    <div class="section-title">🏗️ 3D Geometry Generator</div>
+                    <p style="font-size: 14px; color: #666; margin-bottom: 15px;">
+                        Create 3D extruded solids from layer contours with optional voids and vertical translation.
+                    </p>
+                    
+                    <div style="margin-bottom: 15px;">
+                        <button class="btn-primary" onclick="addGeometryRow()">+ Add Extrusion</button>
+                        <button class="btn-secondary" onclick="generateGeometry()">🎲 Generate & View 3D</button>
+                    </div>
+                    
+                    <div id="geometryRows"></div>
+                </div>
+                
                 <!-- Calculator Section -->
                 <div class="section calculator-section" id="calculatorSection" style="display: none;">
                     <div class="section-title">🧮 Advanced Calculator</div>
@@ -1156,6 +1557,7 @@ def get_html_interface():
             let layerDataCache = {};
             let calculatorRowId = 0;
             let layerColors = {}; // Store custom colors for each layer
+            let geometryRowId = 0; // For 3D geometry generator
             
             // Make functions globally available
             window.uploadFile = uploadFile;
@@ -1174,6 +1576,9 @@ def get_html_interface():
             window.setViewLeft = setViewLeft;
             window.setViewRight = setViewRight;
             window.setViewIsometric = setViewIsometric;
+            window.addGeometryRow = addGeometryRow;
+            window.removeGeometryRow = removeGeometryRow;
+            window.generateGeometry = generateGeometry;
             
             // Drag and drop
             const uploadArea = document.getElementById('uploadArea');
@@ -1376,6 +1781,9 @@ def get_html_interface():
                 document.getElementById('filterBtn').disabled = false;
                 document.getElementById('reportBtn').disabled = false;
                 document.getElementById('clearBtn').disabled = false;
+                
+                // Show geometry generator section
+                document.getElementById('geometryGeneratorSection').style.display = 'block';
             }
             
             function getDxfColor(colorIndex) {
@@ -1556,6 +1964,264 @@ def get_html_interface():
                 // Add first row by default
                 addCalculatorRow();
             }
+            
+            // ===== 3D GEOMETRY GENERATOR FUNCTIONS =====
+            
+            function addGeometryRow() {
+                const container = document.getElementById('geometryRows');
+                const rowId = geometryRowId++;
+                
+                const availableLayers = Array.from(selectedLayers);
+                
+                let layerOptions = '<option value="">-- Select Layer --</option>' + 
+                    availableLayers.map(layer => `<option value="${layer}">${layer}</option>`).join('');
+                
+                const row = document.createElement('div');
+                row.className = 'calculator-row';
+                row.id = `geom-row-${rowId}`;
+                row.innerHTML = `
+                    <div style="flex: 1;">
+                        <label style="display: block; font-size: 12px; color: #666; margin-bottom: 4px;">Operation Name</label>
+                        <input type="text" id="geom-name-${rowId}" value="Extrusion ${rowId + 1}" placeholder="e.g., Walls, Foundation"
+                               style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 4px;">
+                    </div>
+                    <div style="flex: 0.5;">
+                        <label style="display: block; font-size: 12px; color: #666; margin-bottom: 4px;">Color</label>
+                        <input type="color" id="geom-color-${rowId}" value="#4CAF50" 
+                               style="width: 100%; height: 38px; border: 1px solid #e0e0e0; border-radius: 4px; cursor: pointer;">
+                    </div>
+                    <div style="flex: 1;">
+                        <label style="display: block; font-size: 12px; color: #666; margin-bottom: 4px;">Contour Layer</label>
+                        <select id="geom-contour-${rowId}" style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 4px;">
+                            ${layerOptions}
+                        </select>
+                    </div>
+                    <div style="flex: 1;">
+                        <label style="display: block; font-size: 12px; color: #666; margin-bottom: 4px;">Cut Layer (Optional)</label>
+                        <select id="geom-cut-${rowId}" style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 4px;">
+                            <option value="">-- No Cuts --</option>
+                            ${layerOptions}
+                        </select>
+                    </div>
+                    <div style="flex: 0.8;">
+                        <label style="display: block; font-size: 12px; color: #666; margin-bottom: 4px;">Z Offset (mm)</label>
+                        <input type="number" id="geom-offset-${rowId}" value="0" step="0.1" 
+                               style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 4px;">
+                    </div>
+                    <div style="flex: 0.8;">
+                        <label style="display: block; font-size: 12px; color: #666; margin-bottom: 4px;">Height (mm)</label>
+                        <input type="number" id="geom-height-${rowId}" value="100" step="0.1" min="0.1"
+                               style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 4px;">
+                    </div>
+                    <button class="remove-calc-btn" onclick="removeGeometryRow(${rowId})" title="Remove">✕</button>
+                `;
+                
+                container.appendChild(row);
+                
+                // Show the section
+                document.getElementById('geometryGeneratorSection').style.display = 'block';
+            }
+            
+            function removeGeometryRow(rowId) {
+                const row = document.getElementById(`geom-row-${rowId}`);
+                if (row) {
+                    row.remove();
+                }
+                
+                // Hide section if no rows
+                const container = document.getElementById('geometryRows');
+                if (container.children.length === 0) {
+                    document.getElementById('geometryGeneratorSection').style.display = 'none';
+                }
+            }
+            
+            async function generateGeometry() {
+                const container = document.getElementById('geometryRows');
+                if (container.children.length === 0) {
+                    showStatus('Please add at least one extrusion first!', 'error');
+                    return;
+                }
+                
+                if (!currentFileId) {
+                    showStatus('Please upload a file first!', 'error');
+                    return;
+                }
+                
+                // Collect all extrusion configurations
+                const extrusions = [];
+                for (let i = 0; i < container.children.length; i++) {
+                    const row = container.children[i];
+                    const rowId = row.id.split('-')[2];
+                    
+                    const operationName = document.getElementById(`geom-name-${rowId}`).value || `Extrusion ${i + 1}`;
+                    const operationColor = document.getElementById(`geom-color-${rowId}`).value || '#4CAF50';
+                    const contourLayer = document.getElementById(`geom-contour-${rowId}`).value;
+                    const cutLayer = document.getElementById(`geom-cut-${rowId}`).value;
+                    const zOffset = parseFloat(document.getElementById(`geom-offset-${rowId}`).value) || 0;
+                    const height = parseFloat(document.getElementById(`geom-height-${rowId}`).value) || 100;
+                    
+                    if (!contourLayer) {
+                        showStatus(`Row ${i + 1}: Please select a contour layer!`, 'error');
+                        return;
+                    }
+                    
+                    if (height <= 0) {
+                        showStatus(`Row ${i + 1}: Height must be greater than 0!`, 'error');
+                        return;
+                    }
+                    
+                    extrusions.push({
+                        operation_name: operationName,
+                        operation_color: operationColor,
+                        contour_layer: contourLayer,
+                        cut_layer: cutLayer || null,
+                        z_offset: zOffset,
+                        height: height
+                    });
+                }
+                
+                showLoading(true);
+                
+                try {
+                    const response = await fetch('/api/generate-3d-geometry', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            file_id: currentFileId,
+                            extrusions: extrusions
+                        })
+                    });
+                    
+                    if (!response.ok) throw new Error('Failed to generate geometry');
+                    
+                    const data = await response.json();
+                    
+                    // Show viewer section and render
+                    document.getElementById('viewerSection').style.display = 'block';
+                    render3DGeometry(data.geometries);
+                    showStatus(`Generated ${data.geometries.length} 3D solid(s) successfully!`, 'success');
+                    
+                } catch (error) {
+                    console.error('Error generating geometry:', error);
+                    showStatus(`Error: ${error.message}`, 'error');
+                } finally {
+                    showLoading(false);
+                }
+            }
+            
+            function render3DGeometry(geometries) {
+                console.log('🎲 Rendering 3D geometry:', geometries.length, 'solids');
+                
+                const traces = [];
+                const volumesByOperation = {};  // Group volumes by operation name
+                
+                geometries.forEach((geom, idx) => {
+                    // Use operation color
+                    const color = geom.operation_color || '#4CAF50';
+                    
+                    // Create mesh3d trace for the solid
+                    const solidName = geom.contour_index !== undefined ? 
+                        `${geom.operation_name} #${geom.contour_index + 1}` : 
+                        geom.operation_name;
+                    
+                    traces.push({
+                        type: 'mesh3d',
+                        x: geom.vertices.map(v => v[0]),
+                        y: geom.vertices.map(v => v[1]),
+                        z: geom.vertices.map(v => v[2]),
+                        i: geom.faces.map(f => f[0]),
+                        j: geom.faces.map(f => f[1]),
+                        k: geom.faces.map(f => f[2]),
+                        color: color,
+                        opacity: 0.8,
+                        flatshading: true,
+                        hoverinfo: 'text',
+                        text: `${solidName}<br>Volume: ${(geom.volume / 1000).toFixed(2)} cm³<br>Height: ${geom.height}mm<br>Z offset: ${geom.z_offset}mm`,
+                        showlegend: true,
+                        name: solidName
+                    });
+                    
+                    // Accumulate volume by operation name
+                    if (!volumesByOperation[geom.operation_name]) {
+                        volumesByOperation[geom.operation_name] = {
+                            volume: 0,
+                            color: geom.operation_color,
+                            count: 0
+                        };
+                    }
+                    volumesByOperation[geom.operation_name].volume += geom.volume;
+                    volumesByOperation[geom.operation_name].count++;
+                });
+                
+                const layout = {
+                    title: `3D Extruded Geometry - ${geometries.length} solid(s)`,
+                    scene: {
+                        xaxis: { title: 'X (mm)', showbackground: true, backgroundcolor: 'rgb(230, 230, 230)' },
+                        yaxis: { title: 'Y (mm)', showbackground: true, backgroundcolor: 'rgb(230, 230, 230)' },
+                        zaxis: { title: 'Z (mm)', showbackground: true, backgroundcolor: 'rgb(230, 230, 230)' },
+                        aspectmode: 'data',
+                        camera: {
+                            eye: { x: 1.5, y: 1.5, z: 1.5 }
+                        }
+                    },
+                    margin: { l: 0, r: 0, t: 40, b: 0 },
+                    hovermode: 'closest'
+                };
+                
+                const config = {
+                    responsive: true,
+                    displayModeBar: true,
+                    displaylogo: false
+                };
+                
+                Plotly.newPlot('viewerContainer', traces, layout, config);
+                console.log('✅ 3D geometry rendered successfully');
+                
+                // Generate volume pie chart
+                generateVolumeChart(volumesByOperation);
+            }
+            
+            function generateVolumeChart(volumesByOperation) {
+                const operations = Object.keys(volumesByOperation);
+                
+                if (operations.length === 0) return;
+                
+                const values = operations.map(name => volumesByOperation[name].volume / 1000000); // Convert mm³ to cm³
+                const colors = operations.map(name => volumesByOperation[name].color);
+                const labels = operations.map(name => {
+                    const data = volumesByOperation[name];
+                    return `${name} (${data.count} solid${data.count > 1 ? 's' : ''})`;
+                });
+                
+                const trace = {
+                    type: 'pie',
+                    labels: labels,
+                    values: values,
+                    marker: {
+                        colors: colors
+                    },
+                    texttemplate: '%{label}<br>%{value:.2f} cm³<br>%{percent}',
+                    hovertemplate: '<b>%{label}</b><br>Volume: %{value:.2f} cm³<br>%{percent}<extra></extra>'
+                };
+                
+                const layout = {
+                    title: 'Volume Distribution by Operation',
+                    showlegend: true,
+                    height: 400
+                };
+                
+                const config = {
+                    responsive: true,
+                    displayModeBar: true,
+                    displaylogo: false
+                };
+                
+                document.getElementById('volumeAnalysisSection').style.display = 'block';
+                Plotly.newPlot('volumeChartContainer', [trace], layout, config);
+                console.log('📊 Volume chart generated');
+            }
+            
+            // ===== CALCULATOR FUNCTIONS =====
             
             function addCalculatorRow() {
                 const container = document.getElementById('calculatorRows');
