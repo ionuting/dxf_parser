@@ -12,10 +12,17 @@ import uuid
 from typing import List
 import logging
 import json
-from shapely.geometry import Polygon, Point
-from shapely.ops import unary_union
-import triangle
-import numpy as np
+
+# Optional imports for advanced boolean operations
+try:
+    from shapely.geometry import Polygon, Point
+    from shapely.ops import unary_union
+    import triangle
+    import numpy as np
+    SHAPELY_AVAILABLE = True
+except ImportError:
+    SHAPELY_AVAILABLE = False
+    print("⚠️ Shapely/Triangle not available - using simple extrusion only")
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -455,6 +462,10 @@ def create_simple_extrusion(contour_points, z_offset, height):
 
 def triangulate_polygon_with_holes(exterior, holes, z_offset, height):
     """Triangulate polygon with holes using triangle library"""
+    if not SHAPELY_AVAILABLE:
+        # Fallback to simple extrusion if shapely not available
+        return create_simple_extrusion(exterior, z_offset, height)
+    
     vertices = []
     faces = []
     
@@ -466,8 +477,8 @@ def triangulate_polygon_with_holes(exterior, holes, z_offset, height):
     # Add exterior points
     exterior_start = vertex_idx
     for i, point in enumerate(exterior):
-        all_points.append([point[0], point[1]])
-        segments.append([vertex_idx, (vertex_idx + 1) if i < len(exterior) - 1 else exterior_start])
+        all_points.append([float(point[0]), float(point[1])])
+        segments.append([int(vertex_idx), int((vertex_idx + 1) if i < len(exterior) - 1 else exterior_start)])
         vertex_idx += 1
     
     # Add holes
@@ -475,22 +486,22 @@ def triangulate_polygon_with_holes(exterior, holes, z_offset, height):
     for hole in holes:
         hole_start = vertex_idx
         # Calculate hole center for hole marker
-        hole_center = [sum(p[0] for p in hole) / len(hole), sum(p[1] for p in hole) / len(hole)]
+        hole_center = [float(sum(p[0] for p in hole) / len(hole)), float(sum(p[1] for p in hole) / len(hole))]
         hole_points.append(hole_center)
         
         for i, point in enumerate(hole):
-            all_points.append([point[0], point[1]])
-            segments.append([vertex_idx, (vertex_idx + 1) if i < len(hole) - 1 else hole_start])
+            all_points.append([float(point[0]), float(point[1])])
+            segments.append([int(vertex_idx), int((vertex_idx + 1) if i < len(hole) - 1 else hole_start)])
             vertex_idx += 1
     
-    # Create triangle input
+    # Create triangle input with explicit dtypes
     tri_input = {
-        'vertices': np.array(all_points),
-        'segments': np.array(segments)
+        'vertices': np.array(all_points, dtype=np.float64),
+        'segments': np.array(segments, dtype=np.int32)
     }
     
     if hole_points:
-        tri_input['holes'] = np.array(hole_points)
+        tri_input['holes'] = np.array(hole_points, dtype=np.float64)
     
     # Triangulate
     try:
@@ -705,56 +716,90 @@ async def generate_3d_geometry(request: Request):
             
             # Create a separate geometry for each contour
             for contour_idx, contour_points in enumerate(contours):
-                # Use Shapely for boolean difference if cut_layer is specified
-                if cut_contours:
-                    # Create main polygon from contour
-                    main_polygon = Polygon(contour_points)
+                # Use Shapely for boolean difference if cut_layer is specified and Shapely is available
+                if cut_contours and SHAPELY_AVAILABLE:
+                    try:
+                        # Create main polygon from contour
+                        main_polygon = Polygon(contour_points)
+                        
+                        # Create cut polygons
+                        cut_polygons = [Polygon(cut_contour) for cut_contour in cut_contours]
+                        cut_union = unary_union(cut_polygons)
+                        
+                        # Perform boolean difference
+                        result_polygon = main_polygon.difference(cut_union)
+                        
+                        # Check if result is valid
+                        if result_polygon.is_empty:
+                            continue
+                        
+                        # Get exterior and holes
+                        if result_polygon.geom_type == 'Polygon':
+                            exterior_coords = list(result_polygon.exterior.coords[:-1])  # Remove duplicate last point
+                            holes = [list(hole.coords[:-1]) for hole in result_polygon.interiors]
+                        elif result_polygon.geom_type == 'MultiPolygon':
+                            # Handle multiple polygons - process each separately
+                            for poly in result_polygon.geoms:
+                                exterior_coords = list(poly.exterior.coords[:-1])
+                                holes = [list(hole.coords[:-1]) for hole in poly.interiors]
+                                vertices, faces = triangulate_polygon_with_holes(exterior_coords, holes, z_offset, height)
+                                
+                                volume = poly.area * height
+                                
+                                geometries.append({
+                                    "operation_name": operation_name,
+                                    "operation_color": operation_color,
+                                    "contour_layer": contour_layer,
+                                    "contour_index": contour_idx,
+                                    "cut_layer": cut_layer,
+                                    "z_offset": z_offset,
+                                    "height": height,
+                                    "volume": volume,
+                                    "vertices": vertices,
+                                    "faces": faces,
+                                    "vertex_count": len(vertices),
+                                    "face_count": len(faces)
+                                })
+                            continue
+                        else:
+                            continue
+                        
+                        # Triangulate polygon with holes
+                        vertices, faces = triangulate_polygon_with_holes(exterior_coords, holes, z_offset, height)
+                        volume = result_polygon.area * height
+                        
+                    except Exception as e:
+                        logger.warning(f"Shapely boolean operation failed: {e}, using simple extrusion")
+                        # Fallback to simple extrusion
+                        vertices, faces = create_simple_extrusion(contour_points, z_offset, height)
+                        
+                        # Calculate volume using Shoelace formula (subtract cut area)
+                        area = 0
+                        n = len(contour_points)
+                        for i in range(n):
+                            j = (i + 1) % n
+                            area += contour_points[i][0] * contour_points[j][1]
+                            area -= contour_points[j][0] * contour_points[i][1]
+                        effective_area = abs(area) / 2.0 - cut_area
+                        if effective_area < 0:
+                            effective_area = 0
+                        volume = effective_area * height
+                        
+                elif cut_contours and not SHAPELY_AVAILABLE:
+                    # Shapely not available - use simple volume subtraction
+                    vertices, faces = create_simple_extrusion(contour_points, z_offset, height)
                     
-                    # Create cut polygons
-                    cut_polygons = [Polygon(cut_contour) for cut_contour in cut_contours]
-                    cut_union = unary_union(cut_polygons)
-                    
-                    # Perform boolean difference
-                    result_polygon = main_polygon.difference(cut_union)
-                    
-                    # Check if result is valid
-                    if result_polygon.is_empty:
-                        continue
-                    
-                    # Get exterior and holes
-                    if result_polygon.geom_type == 'Polygon':
-                        exterior_coords = list(result_polygon.exterior.coords[:-1])  # Remove duplicate last point
-                        holes = [list(hole.coords[:-1]) for hole in result_polygon.interiors]
-                    elif result_polygon.geom_type == 'MultiPolygon':
-                        # Handle multiple polygons - process each separately
-                        for poly in result_polygon.geoms:
-                            exterior_coords = list(poly.exterior.coords[:-1])
-                            holes = [list(hole.coords[:-1]) for hole in poly.interiors]
-                            vertices, faces = triangulate_polygon_with_holes(exterior_coords, holes, z_offset, height)
-                            
-                            volume = poly.area * height
-                            
-                            geometries.append({
-                                "operation_name": operation_name,
-                                "operation_color": operation_color,
-                                "contour_layer": contour_layer,
-                                "contour_index": contour_idx,
-                                "cut_layer": cut_layer,
-                                "z_offset": z_offset,
-                                "height": height,
-                                "volume": volume,
-                                "vertices": vertices,
-                                "faces": faces,
-                                "vertex_count": len(vertices),
-                                "face_count": len(faces)
-                            })
-                        continue
-                    else:
-                        continue
-                    
-                    # Triangulate polygon with holes
-                    vertices, faces = triangulate_polygon_with_holes(exterior_coords, holes, z_offset, height)
-                    volume = result_polygon.area * height
+                    # Calculate volume using Shoelace formula (subtract cut area)
+                    area = 0
+                    n = len(contour_points)
+                    for i in range(n):
+                        j = (i + 1) % n
+                        area += contour_points[i][0] * contour_points[j][1]
+                        area -= contour_points[j][0] * contour_points[i][1]
+                    effective_area = abs(area) / 2.0 - cut_area
+                    if effective_area < 0:
+                        effective_area = 0
+                    volume = effective_area * height
                     
                 else:
                     # No cut layer - simple extrusion
