@@ -1048,13 +1048,14 @@ async def generate_report(request: Request):
 
 @app.post("/api/download-csv-report")
 async def download_csv_report(request: Request):
-    """Generează și descarcă raportul complet (statistici + extruziuni) ca CSV"""
+    """Generează și descarcă raportul complet (statistici + extruziuni + calculații) ca CSV"""
     import math
     try:
         payload = await request.json()
         file_id = payload.get("file_id")
         selected_layers = payload.get("selected_layers", [])
         extrusions = payload.get("extrusions", [])
+        calculations = payload.get("calculations", [])
         unit = payload.get("unit", "mm")
 
         if file_id not in loaded_files:
@@ -1148,6 +1149,14 @@ async def download_csv_report(request: Request):
 
         # --- 3. Scriere CSV ---
         def csv_rows():
+            # Secțiunea 0: Calculații (dacă există)
+            if calculations:
+                yield ["Calculations", ""]
+                yield ["Name", "Result"]
+                for calc in calculations:
+                    yield [calc.get("name", ""), round(calc.get("result", 0), 3)]
+                yield []
+            
             # Secțiunea 1: Statistici per layer
             if layer_reports:
                 yield ["Layer Statistics", "", "", "", "", ""]
@@ -2213,7 +2222,28 @@ def get_html_interface():
                 
                 try {
                     const extrusions = [];
+                    const calculations = [];
                     const geometryRows = document.getElementById('geometryRows');
+                    const calculatorRows = document.getElementById('calculatorRows');
+                    
+                    // Collect calculator data if any rows exist
+                    if (calculatorRows && calculatorRows.children.length > 0) {
+                        for (let i = 0; i < calculatorRows.children.length; i++) {
+                            const row = calculatorRows.children[i];
+                            const rowId = row.id.replace('calcRow', '');
+                            
+                            const calcName = document.getElementById(`calcName${rowId}`).value || `Calculation ${i + 1}`;
+                            const resultInput = row.querySelector('.result-input');
+                            const resultValue = resultInput.value;
+                            
+                            if (resultValue) {
+                                calculations.push({
+                                    name: calcName,
+                                    result: parseFloat(resultValue)
+                                });
+                            }
+                        }
+                    }
                     
                     // Collect extrusion data if any rows exist
                     if (geometryRows && geometryRows.children.length > 0) {
@@ -2268,6 +2298,7 @@ def get_html_interface():
                             file_id: currentFileId,
                             selected_layers: Array.from(selectedLayers),
                             extrusions: extrusions,
+                            calculations: calculations,
                             unit: document.getElementById('calcUnit').value || 'mm'
                         })
                     });
@@ -2585,32 +2616,92 @@ def get_html_interface():
                 
                 const availableLayers = Array.from(selectedLayers);
                 
-                let layerOptions = availableLayers.map(layer => 
-                    `<option value="${layer}">${layer}</option>`
-                ).join('');
+                let layerOptions = '<option value="">-- Layer --</option>' + 
+                    availableLayers.map(layer => `<option value="layer:${layer}">${layer}</option>`).join('');
                 
                 const rowHTML = `
-                    <div class="calculator-row" id="calcRow${rowId}">
-                        <select class="layer-select" onchange="calculateRow(${rowId})">
-                            <option value="">Select Layer</option>
-                            ${layerOptions}
-                        </select>
-                        <select class="operator-select" onchange="calculateRow(${rowId})">
-                            <option value="+">+</option>
-                            <option value="-">-</option>
-                            <option value="*">×</option>
-                            <option value="/">/</option>
-                        </select>
-                        <select class="layer-select" onchange="calculateRow(${rowId})">
-                            <option value="">Select Layer</option>
-                            ${layerOptions}
-                        </select>
-                        <input type="text" class="result-input" readonly placeholder="Result">
-                        <button class="remove-btn" onclick="removeCalculatorRow(${rowId})" title="Remove">×</button>
+                    <div id="calcRow${rowId}" style="margin-bottom: 10px;">
+                        <!-- Name Row -->
+                        <div style="display: flex; gap: 10px; margin-bottom: 8px;">
+                            <div style="flex: 1;">
+                                <input type="text" id="calcName${rowId}" class="calc-input" placeholder="Calculation name (e.g., Total Area)" style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 4px; font-size: 13px;">
+                            </div>
+                            <button class="remove-btn" onclick="removeCalculatorRow(${rowId})" title="Remove" style="padding: 8px 12px; align-self: flex-start;">×</button>
+                        </div>
+                        
+                        <!-- Calculation Row -->
+                        <div style="display: flex; gap: 8px; align-items: flex-end; background: white; padding: 10px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                            <!-- Value 1 Type + Select -->
+                            <div style="flex: 0.7;">
+                                <label style="display: block; font-size: 10px; color: #999; margin-bottom: 3px; font-weight: 600;">Type</label>
+                                <select class="calc-input" id="calcInput1Type${rowId}" onchange="updateCalculatorInput(${rowId}, 1)" style="padding: 6px; font-size: 12px;">
+                                    <option value="layer">Layer</option>
+                                    <option value="number">Number</option>
+                                </select>
+                            </div>
+                            
+                            <!-- Value 1 Selection -->
+                            <div style="flex: 1.5;">
+                                <select class="calc-input" id="calcInput1${rowId}" onchange="calculateRow(${rowId})" style="display: block; padding: 6px; font-size: 12px;">
+                                    ${layerOptions}
+                                </select>
+                                <input type="number" id="calcInput1Num${rowId}" class="calc-input" placeholder="0" onchange="calculateRow(${rowId})" style="display: none; padding: 6px; font-size: 12px;">
+                            </div>
+                            
+                            <!-- Operator -->
+                            <div style="flex: 0.5;">
+                                <label style="display: block; font-size: 10px; color: #999; margin-bottom: 3px; font-weight: 600;">Op</label>
+                                <select class="calc-input operator-select" id="calcOp${rowId}" onchange="calculateRow(${rowId})" style="padding: 6px; font-size: 12px;">
+                                    <option value="+">+</option>
+                                    <option value="-">-</option>
+                                    <option value="*">×</option>
+                                    <option value="/">/</option>
+                                </select>
+                            </div>
+                            
+                            <!-- Value 2 Type + Select -->
+                            <div style="flex: 0.7;">
+                                <label style="display: block; font-size: 10px; color: #999; margin-bottom: 3px; font-weight: 600;">Type</label>
+                                <select class="calc-input" id="calcInput2Type${rowId}" onchange="updateCalculatorInput(${rowId}, 2)" style="padding: 6px; font-size: 12px;">
+                                    <option value="layer">Layer</option>
+                                    <option value="number">Number</option>
+                                </select>
+                            </div>
+                            
+                            <!-- Value 2 Selection -->
+                            <div style="flex: 1.5;">
+                                <select class="calc-input" id="calcInput2${rowId}" onchange="calculateRow(${rowId})" style="display: block; padding: 6px; font-size: 12px;">
+                                    ${layerOptions}
+                                </select>
+                                <input type="number" id="calcInput2Num${rowId}" class="calc-input" placeholder="0" onchange="calculateRow(${rowId})" style="display: none; padding: 6px; font-size: 12px;">
+                            </div>
+                            
+                            <!-- Result -->
+                            <div style="flex: 1.2;">
+                                <label style="display: block; font-size: 10px; color: #999; margin-bottom: 3px; font-weight: 600;">Result</label>
+                                <input type="text" class="result-input" readonly placeholder="0" style="padding: 6px; font-size: 12px; font-weight: 600;">
+                            </div>
+                        </div>
                     </div>
                 `;
                 
                 container.insertAdjacentHTML('beforeend', rowHTML);
+            }
+            
+            function updateCalculatorInput(rowId, inputNum) {
+                const typeSelect = document.getElementById(`calcInput${inputNum}Type${rowId}`);
+                const layerSelect = document.getElementById(`calcInput${inputNum}${rowId}`);
+                const numInput = document.getElementById(`calcInput${inputNum}Num${rowId}`);
+                
+                if (typeSelect.value === 'layer') {
+                    layerSelect.style.display = 'block';
+                    numInput.style.display = 'none';
+                } else {
+                    layerSelect.style.display = 'none';
+                    numInput.style.display = 'block';
+                }
+                
+                calculateRow(rowId);
             }
             
             function removeCalculatorRow(rowId) {
@@ -2624,24 +2715,44 @@ def get_html_interface():
                 const row = document.getElementById(`calcRow${rowId}`);
                 if (!row) return;
                 
-                const selects = row.querySelectorAll('.layer-select');
-                const operator = row.querySelector('.operator-select').value;
+                const type1 = document.getElementById(`calcInput1Type${rowId}`).value;
+                const type2 = document.getElementById(`calcInput2Type${rowId}`).value;
+                
+                const operator = document.getElementById(`calcOp${rowId}`).value;
                 const resultInput = row.querySelector('.result-input');
                 
-                const layer1 = selects[0].value;
-                const layer2 = selects[1].value;
+                let value1 = 0;
+                let value2 = 0;
                 
-                if (!layer1 || !layer2) {
-                    resultInput.value = '';
-                    return;
+                // Get value 1
+                if (type1 === 'layer') {
+                    const layer1 = document.getElementById(`calcInput1${rowId}`).value;
+                    if (!layer1) {
+                        resultInput.value = '';
+                        return;
+                    }
+                    const propertyType = document.getElementById('calcPropertyType').value;
+                    const unit = document.getElementById('calcUnit').value;
+                    value1 = getLayerValue(layer1.replace('layer:', ''), propertyType, unit);
+                } else {
+                    const numVal = parseFloat(document.getElementById(`calcInput1Num${rowId}`).value);
+                    value1 = isNaN(numVal) ? 0 : numVal;
                 }
                 
-                const propertyType = document.getElementById('calcPropertyType').value;
-                const unit = document.getElementById('calcUnit').value;
-                
-                // Get converted values
-                const value1 = getLayerValue(layer1, propertyType, unit);
-                const value2 = getLayerValue(layer2, propertyType, unit);
+                // Get value 2
+                if (type2 === 'layer') {
+                    const layer2 = document.getElementById(`calcInput2${rowId}`).value;
+                    if (!layer2) {
+                        resultInput.value = '';
+                        return;
+                    }
+                    const propertyType = document.getElementById('calcPropertyType').value;
+                    const unit = document.getElementById('calcUnit').value;
+                    value2 = getLayerValue(layer2.replace('layer:', ''), propertyType, unit);
+                } else {
+                    const numVal = parseFloat(document.getElementById(`calcInput2Num${rowId}`).value);
+                    value2 = isNaN(numVal) ? 0 : numVal;
+                }
                 
                 let result = 0;
                 switch(operator) {
